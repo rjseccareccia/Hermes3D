@@ -197,4 +197,67 @@ describe("session settings mutations helper", () => {
       );
     expect(failureLines).toHaveLength(0);
   });
+
+  it("reverts to the previous model when Hermes does not confirm a set", async () => {
+    const dispatch = vi.fn();
+    const client = {
+      call: vi.fn(async () => ({ ok: true, key: "agent:1:studio:abc" })),
+    } as unknown as GatewayClient;
+
+    await applySessionSettingMutation({
+      agents: [{ agentId: "agent-1", sessionCreated: true, model: "openai/previous" }],
+      dispatch,
+      client,
+      agentId: "agent-1",
+      sessionKey: "agent:1:studio:abc",
+      field: "model",
+      value: "openai/target",
+    });
+
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "updateAgent",
+      agentId: "agent-1",
+      patch: { model: "openai/target", sessionSettingsSynced: false },
+    });
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "updateAgent",
+      agentId: "agent-1",
+      patch: { model: "openai/previous", sessionSettingsSynced: true, sessionCreated: true },
+    });
+    expect(dispatch).toHaveBeenLastCalledWith({
+      type: "appendOutput",
+      agentId: "agent-1",
+      line: "Model update failed: Hermes did not confirm the model change.",
+    });
+  });
+
+  it("reverts to the previous model and surfaces Hermes' refusal reason", async () => {
+    const dispatch = vi.fn();
+    const client = {
+      call: vi.fn(async () => {
+        throw new Error("Hermes did not activate the requested model.");
+      }),
+    } as unknown as GatewayClient;
+
+    await applySessionSettingMutation({
+      agents: [{ agentId: "agent-1", sessionCreated: true, model: "openai/previous" }],
+      dispatch,
+      client,
+      agentId: "agent-1",
+      sessionKey: "agent:1:studio:abc",
+      field: "model",
+      value: "openai/target",
+    });
+
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "updateAgent",
+      agentId: "agent-1",
+      patch: { model: "openai/previous", sessionSettingsSynced: true, sessionCreated: true },
+    });
+    expect(dispatch).toHaveBeenLastCalledWith({
+      type: "appendOutput",
+      agentId: "agent-1",
+      line: "Model update failed: Hermes did not activate the requested model.",
+    });
+  });
 });

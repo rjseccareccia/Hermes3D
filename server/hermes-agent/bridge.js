@@ -235,8 +235,42 @@ const resolveDefaultAgentId = (agents) => {
   return explicit?.id ?? agents[0]?.id ?? AGENT_ID;
 };
 
-const modelSwitchValue = (provider, model) =>
-  `${model} --provider ${provider} --session`;
+/** Hermes refusal reasons for a canonical `session.mutate` model change. */
+const MODEL_MUTATION_REFUSALS = {
+  invalid_params: "Hermes rejected the model change request.",
+  revision_conflict: "The session changed before the model change arrived. Try again.",
+  stale_generation: "The session started a new turn before the model change arrived. Try again.",
+  session_busy: "The session is busy. Try the model change again when its current turn finishes.",
+  unknown_execution: "The session has an unresolved turn. The model was not changed.",
+  permission_denied: "Hermes denied the model change.",
+  model_resolution_failed: "Hermes could not resolve that provider and model.",
+};
+
+/** A model change that Hermes refused, did not commit, or did not verify. */
+class ModelSwitchError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/** JSON-RPC "method not found": the backend predates canonical `session.mutate`. */
+const JSON_RPC_METHOD_NOT_FOUND = -32601;
+
+const modelMutationFailure = (err) => {
+  if (err instanceof ModelSwitchError) return err;
+  if (err?.code === JSON_RPC_METHOD_NOT_FOUND) {
+    return new ModelSwitchError(
+      "hermes_agent.model_switch_unsupported",
+      "This Hermes backend has no canonical session.mutate. Update Hermes and restart it; the model was not changed.",
+    );
+  }
+  const reason = errorMessage(err);
+  if (Object.hasOwn(MODEL_MUTATION_REFUSALS, reason)) {
+    return new ModelSwitchError(`hermes_agent.${reason}`, MODEL_MUTATION_REFUSALS[reason]);
+  }
+  return new ModelSwitchError("hermes_agent.model_not_applied", `Hermes did not apply the model change: ${reason}`);
+};
 
 const canonicalModelProvider = (provider) => asString(provider).toLowerCase().replace(/[^a-z0-9_-]/g, "");
 
@@ -489,6 +523,55 @@ function createHermesAgentUpstream(options) {
     sessionLoads.set(sessionKey, load);
     load.finally(() => sessionLoads.delete(sessionKey)).catch(() => {});
     return load;
+  };
+
+  /**
+   * Canonical model change. The session's revision and execution generation are
+   * read from `session.resume` and sent as the fence of one `session.mutate`.
+   * A committed receipt and the session's effective model must both be observed:
+   * the RPC envelope alone is never taken as proof that the switch happened.
+   */
+  const switchSessionModel = async ({ runtimeId, profile, choice, rows }) => {
+    const scope = profile ? { profile } : {};
+    let receipt;
+    try {
+      const snapshot = await client.request("session.resume", { session_id: runtimeId, ...scope }, SESSION_RPC_TIMEOUT_MS);
+      if (!Number.isInteger(snapshot?.revision) || !Number.isInteger(snapshot?.execution_generation)) {
+        throw new ModelSwitchError(
+          "hermes_agent.model_fence_unavailable",
+          "Hermes did not report the session revision and execution generation, so the model was not changed.",
+        );
+      }
+      receipt = await client.request("session.mutate", {
+        session_id: runtimeId,
+        request_id: randomUUID(),
+        expected_revision: snapshot.revision,
+        expected_generation: snapshot.execution_generation,
+        operation: "model",
+        payload: { model: choice.id, provider: choice.provider },
+        ...scope,
+      }, SESSION_RPC_TIMEOUT_MS);
+    } catch (err) {
+      throw modelMutationFailure(err);
+    }
+    if (receipt?.status === "confirmation_required") {
+      throw new ModelSwitchError(
+        "hermes_agent.model_confirmation_required",
+        `${asString(receipt.confirm_message, "Hermes requires confirmation for this model.")} The model was not switched.`,
+      );
+    }
+    if (receipt?.status === "deferred" || receipt?.status === "pending") {
+      throw new ModelSwitchError("hermes_agent.model_not_applied", "Hermes accepted the model change but has not applied it yet.");
+    }
+    if (!Number.isInteger(receipt?.revision)) {
+      throw new ModelSwitchError("hermes_agent.model_not_applied", "Hermes returned no committed receipt for the model change.");
+    }
+    const effective = await client.request("model.options", { ...scope, session_id: runtimeId });
+    const actual = resultingModel(effective?.model, effective?.provider, rows);
+    if (!actual || actual.id !== choice.id || actual.provider !== choice.provider) {
+      throw new ModelSwitchError("hermes_agent.model_not_applied", "Hermes did not activate the requested model.");
+    }
+    return actual;
   };
 
   // --- upstream event fan-out ----------------------------------------------
@@ -831,17 +914,11 @@ function createHermesAgentUpstream(options) {
           const rows = getModelRows(inventory);
           const choice = parseModelRef(model, rows);
           if (!choice) return resErr(id, "hermes_agent.invalid_model", `Unknown model: ${model}`);
-          const result = await client.request("config.set", {
-            key: "model", value: modelSwitchValue(choice.provider, choice.id),
-            session_id: entry.runtimeId, ...(profile ? { profile } : {}), scope: "session",
-          });
-          if (result?.confirm_required || result?.deferred) {
-            return resErr(id, "hermes_agent.model_not_applied", asString(result?.confirm_message || result?.warning, "Model switch was not applied."));
-          }
-          const actual = await client.request("model.options", { ...(profile ? { profile } : {}), session_id: entry.runtimeId });
-          resolved = resultingModel(actual?.model, actual?.provider, rows);
-          if (!resolved || resolved.id !== choice.id || resolved.provider !== choice.provider) {
-            return resErr(id, "hermes_agent.model_not_applied", "Hermes did not activate the requested model.");
+          try {
+            resolved = await switchSessionModel({ runtimeId: entry.runtimeId, profile, choice, rows });
+          } catch (err) {
+            const failure = modelMutationFailure(err);
+            return resErr(id, failure.code, failure.message);
           }
           entry.model = resolved.id;
           entry.provider = resolved.provider;

@@ -15,6 +15,10 @@
 
 - Lucy team orchestration: `team_roster`, `team_delegate`, `team_delegate_many`, and `team_message` tools (`server/hermes-team-mcp.mjs`) backed by the Studio `/api/team` routes. Each delegated run is correlated by run ID and must report a session belonging to the target agent; a failed or slow target does not discard other targets' results.
 
+### Changed
+
+- Model switches use Hermes' canonical `session.resume` → `session.mutate` (`operation: model`) flow, fenced by the session's revision and execution generation. A switch is reported only after Hermes returns a committed receipt and the session's effective model matches the request. The legacy `config.set` string path is removed. This requires a Hermes backend that implements `session.mutate`; older backends fail with `hermes_agent.model_switch_unsupported`, and the UI reverts the selection.
+
 ### Security
 
 - `/api/team/*` requires `HERMES3D_TEAM_TOKEN` as a bearer token, separate from the Hermes gateway token. Missing tokens are rejected with 401, wrong tokens with 403, and an unset server token fails closed with 503. The Lucy MCP reads its token from a file (`HERMES3D_TEAM_TOKEN_FILE`) and never prints it.

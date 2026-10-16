@@ -88,6 +88,10 @@ export const applySessionSettingMutation = async ({
     } = { sessionSettingsSynced: true, sessionCreated: true };
     if (field === "model") {
       const resolvedModel = resolveModelFromPatchResult(result);
+      if (resolvedModel === undefined && value) {
+        // A set without Hermes' resolved model is not a confirmed switch: throw so the caller reverts.
+        throw new Error("Hermes did not confirm the model change.");
+      }
       if (resolvedModel !== undefined) {
         patch.model = resolvedModel;
       }
