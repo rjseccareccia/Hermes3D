@@ -526,16 +526,18 @@ function createHermesAgentUpstream(options) {
   };
 
   /**
-   * Canonical model change. The session's revision and execution generation are
-   * read from `session.resume` and sent as the fence of one `session.mutate`.
+   * Canonical model change. `session.resume` and `session.mutate` address the
+   * session by its stored id (the runtime id is only for drafts with none); the
+   * session's revision and execution generation are read from the resume and
+   * sent as the fence of one `session.mutate`.
    * A committed receipt and the session's effective model must both be observed:
    * the RPC envelope alone is never taken as proof that the switch happened.
    */
-  const switchSessionModel = async ({ runtimeId, profile, choice, rows }) => {
+  const switchSessionModel = async ({ sessionRef, runtimeId, profile, choice, rows }) => {
     const scope = profile ? { profile } : {};
     let receipt;
     try {
-      const snapshot = await client.request("session.resume", { session_id: runtimeId, ...scope }, SESSION_RPC_TIMEOUT_MS);
+      const snapshot = await client.request("session.resume", { session_id: sessionRef, ...scope }, SESSION_RPC_TIMEOUT_MS);
       if (!Number.isInteger(snapshot?.revision) || !Number.isInteger(snapshot?.execution_generation)) {
         throw new ModelSwitchError(
           "hermes_agent.model_switch_unsupported",
@@ -543,7 +545,7 @@ function createHermesAgentUpstream(options) {
         );
       }
       receipt = await client.request("session.mutate", {
-        session_id: runtimeId,
+        session_id: sessionRef,
         request_id: randomUUID(),
         expected_revision: snapshot.revision,
         expected_generation: snapshot.execution_generation,
@@ -915,7 +917,7 @@ function createHermesAgentUpstream(options) {
           const choice = parseModelRef(model, rows);
           if (!choice) return resErr(id, "hermes_agent.invalid_model", `Unknown model: ${model}`);
           try {
-            resolved = await switchSessionModel({ runtimeId: entry.runtimeId, profile, choice, rows });
+            resolved = await switchSessionModel({ sessionRef: entry.storedId || entry.runtimeId, runtimeId: entry.runtimeId, profile, choice, rows });
           } catch (err) {
             const failure = modelMutationFailure(err);
             return resErr(id, failure.code, failure.message);

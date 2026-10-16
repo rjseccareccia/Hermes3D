@@ -722,7 +722,7 @@ describe("hermes-agent bridge", () => {
       }),
       "session.mutate": (params) => {
         expect(params).toMatchObject({
-          session_id: "runtime-1",
+          session_id: "main-stored",
           operation: "model",
           payload: { model: "target", provider: "ollama-cloud" },
           expected_revision: 7,
@@ -740,6 +740,8 @@ describe("hermes-agent bridge", () => {
     expect(response.ok).toBe(true);
     expect(at(response, "payload.resolved")).toEqual({ model: "target", modelProvider: "ollama-cloud" });
     expect(agent.received.some((frame) => frame.method === "config.set")).toBe(false);
+    const fenceReads = agent.received.filter((frame) => frame.method === "session.resume");
+    expect(fenceReads.at(-1)).toMatchObject({ params: { session_id: "main-stored" } });
 
     bridge.send({ type: "req", id: "agents-after-switch", method: "agents.list", params: {} });
     const agents = await bridge.waitFor((f) => f.type === "res" && f.id === "agents-after-switch", "agents after switch");
