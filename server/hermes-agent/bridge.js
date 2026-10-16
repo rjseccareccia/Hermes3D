@@ -538,8 +538,8 @@ function createHermesAgentUpstream(options) {
       const snapshot = await client.request("session.resume", { session_id: runtimeId, ...scope }, SESSION_RPC_TIMEOUT_MS);
       if (!Number.isInteger(snapshot?.revision) || !Number.isInteger(snapshot?.execution_generation)) {
         throw new ModelSwitchError(
-          "hermes_agent.model_fence_unavailable",
-          "Hermes did not report the session revision and execution generation, so the model was not changed.",
+          "hermes_agent.model_switch_unsupported",
+          "This Hermes backend does not report the canonical session revision and execution generation. Update Hermes and restart it; the model was not changed.",
         );
       }
       receipt = await client.request("session.mutate", {

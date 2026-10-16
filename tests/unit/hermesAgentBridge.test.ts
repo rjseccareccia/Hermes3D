@@ -827,7 +827,7 @@ describe("hermes-agent bridge", () => {
       "session.mutate": () => { throw new Error("must not be called without a fence"); },
     }, "openai/target");
     expect(response.ok).toBe(false);
-    expect(at(response, "error.code")).toBe("hermes_agent.model_fence_unavailable");
+    expect(at(response, "error.code")).toBe("hermes_agent.model_switch_unsupported");
     expect(received.some((frame) => frame.method === "session.mutate")).toBe(false);
   });
 
