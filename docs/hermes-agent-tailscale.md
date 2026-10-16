@@ -67,6 +67,17 @@ HERMES_DASHBOARD_SESSION_TOKEN="$HERMES3D_OFFICE_TOKEN" \
   hermes serve --host 127.0.0.1 --port 9120 --skip-build
 ```
 
+### Model discovery and session-specific switching
+
+The bridge reads `model.options` separately for each Hermes profile and exposes
+the union of configured models with provider-qualified IDs. Each entry carries
+`agentIds` membership, so a shared catalog can be filtered to the selected
+profile. A model change is applied to the selected live session using
+`config.set`'s explicit `--session` model-switch mode; deferred or confirmation-
+required switches are returned as failures rather than shown as active. Model
+inventory RPC failures are surfaced instead of replaced with a fabricated
+fallback model.
+
 An inline assignment is not overridden by `.env`, because the pinned name there
 is different. Read the value straight out of the file if your shell has not
 exported it:

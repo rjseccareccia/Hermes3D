@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Restore Hermes profile main chats from persistent sessions before the first prompt. Initial selection follows Hermes' last-activity order; backend/profile-scoped stored IDs are pinned in Studio's persistent data directory. History and previews resume lazily, report backend failures, and never substitute another profile or silently create a replacement conversation.
+- Keep New Session scoped to the selected profile, preserve older conversations, and hide the selected stored session's duplicate list entry. Unsubmitted drafts remain empty across reconnects; transcripts stay exclusively in Hermes.
+- Hydrate the Office chat transcript on opening an agent, using the existing canonical history-sync operation rather than waiting for a new run event.
+- Prefer interactive Hermes session sources when selecting an unpinned main or replacing a deleted selection. Valid pins and New Session drafts remain authoritative; API/unknown-provenance sessions cannot outrank recognized chat surfaces. Preserve Hermes activity order within each source category.
+
 ## [0.1.4] - 2026-04-23
 
 Runtime Profiles, Multi-Floor Offices, Remote Collaboration, and Diagnostics.
