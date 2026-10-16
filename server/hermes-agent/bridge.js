@@ -8,10 +8,9 @@
  * `close`, `terminate`, and the open/message/close/error events), so the proxy's
  * connect handling and lifecycle stay untouched.
  *
- * Hermes3D talks in agents and session keys; hermes-agent talks in runtime
- * session ids. A hermes-agent backend is a single agent, so the fleet is
- * synthesised as one entry and session keys are mapped onto runtime sessions
- * that are created or resumed on first use.
+ * Hermes3D talks in agents and session keys; hermes-agent profiles own durable
+ * session stores. Main keys alias a pinned stored session per backend/profile,
+ * while runtime sessions attach lazily for history, previews, and prompts.
  */
 
 const { EventEmitter } = require("node:events");
@@ -19,6 +18,7 @@ const { randomUUID } = require("node:crypto");
 
 const { HermesAgentJsonRpcClient, redactUrl } = require("./jsonrpc-client");
 const { createOfficeSpeechSubscriber } = require("./office-speech");
+const { createSessionSelectionStore, selectInitialSession } = require("./session-selection");
 const {
   KANBAN_TASK_ID_PREFIX,
   toHermes3dKanbanTaskRecord,
@@ -200,6 +200,7 @@ const toHermes3dAgents = (profiles) => {
         identity: { name: display, emoji: isDefault ? "🤖" : "🧑‍💻" },
         role,
         model: asString(p.model),
+        provider: asString(p.provider),
         isDefault,
         profile: isDefault ? "" : name,
       };
@@ -212,11 +213,51 @@ const resolveDefaultAgentId = (agents) => {
   return explicit?.id ?? agents[0]?.id ?? AGENT_ID;
 };
 
+const modelSwitchValue = (provider, model) =>
+  `${model} --provider ${provider} --session`;
+
+const canonicalModelProvider = (provider) => asString(provider).toLowerCase().replace(/[^a-z0-9_-]/g, "");
+
+const getModelRows = (result) => {
+  const rows = [];
+  for (const entry of Array.isArray(result?.providers) ? result.providers : []) {
+    const provider = canonicalModelProvider(entry?.slug);
+    if (!provider || !Array.isArray(entry?.models)) continue;
+    for (const raw of entry.models) {
+      const id = asString(typeof raw === "string" ? raw : raw?.id);
+      if (!id) continue;
+      const capability = entry?.capabilities?.[id];
+      rows.push({
+        provider,
+        id,
+        name: typeof raw === "object" && raw ? asString(raw.name, id) : id,
+        ...(capability?.reasoning !== undefined ? { reasoning: Boolean(capability.reasoning) } : {}),
+        ...(typeof capability?.context_window === "number" ? { contextWindow: capability.context_window } : {}),
+      });
+    }
+  }
+  return rows;
+};
+
+const parseModelRef = (value, rows) => {
+  const raw = asString(value);
+  const match = rows.find((row) => raw === `${row.provider}/${row.id}`);
+  return match ? { provider: match.provider, id: match.id } : null;
+};
+
+const resultingModel = (value, provider, rows) => {
+  const ref = parseModelRef(value, rows);
+  if (ref) return ref;
+  const id = asString(value);
+  return id ? { provider: canonicalModelProvider(provider), id } : null;
+};
+
 function createHermesAgentUpstream(options) {
   const {
     url,
     token,
     handshakeTimeoutMs,
+    sessionSelectionPath,
     log = () => {},
     logError = () => {},
   } = options || {};
@@ -239,6 +280,9 @@ function createHermesAgentUpstream(options) {
 
   /** sessionKey -> { runtimeId, storedId, title } */
   const sessions = new Map();
+  const selections = createSessionSelectionStore(url, sessionSelectionPath);
+  const sessionLoads = new Map();
+  const storedLoads = new Map();
   /** runtime session id -> sessionKey */
   const sessionKeyByRuntimeId = new Map();
   /**
@@ -281,7 +325,10 @@ function createHermesAgentUpstream(options) {
     const entry = {
       runtimeId,
       storedId: asString(result?.stored_session_id) || asString(result?.session_key),
+      lineageRootId: asString(result?.lineageRootId) || asString(result?.stored_session_id) || asString(result?.session_key),
       title: asString(result?.info?.title) || asString(result?.title),
+      model: asString(result?.info?.model),
+      provider: canonicalModelProvider(result?.info?.provider),
     };
     sessions.set(sessionKey, entry);
     sessionKeyByRuntimeId.set(runtimeId, sessionKey);
@@ -308,7 +355,8 @@ function createHermesAgentUpstream(options) {
    */
   const profileForAgent = (agentId) => {
     const agent = agentRoster.find((a) => a.id === agentId);
-    return agent ? asString(agent.profile) : "";
+    if (!agent) throw new Error(`Unknown Hermes profile: ${agentId}`);
+    return asString(agent.profile);
   };
 
   /** Main session of whichever agent is default; the roster is known only at runtime. */
@@ -321,32 +369,91 @@ function createHermesAgentUpstream(options) {
    * The agent segment of the key selects the profile, so a prompt sent to
    * `agent:allan:main` runs with Allan's model, skills, and session store.
    */
-  const ensureSession = async (sessionKey) => {
-    const existing = sessions.get(sessionKey);
-    if (existing?.runtimeId) return existing;
-
-    const { agentId, tail } = parseSessionKey(sessionKey);
-    const profile = profileForAgent(agentId);
-    const scope = profile ? { profile } : {};
-
-    // A key of the form `agent:<id>:<storedId>` refers to a stored hermes-agent
-    // session; anything else starts a fresh one.
-    if (tail && tail !== MAIN_KEY) {
-      try {
-        const resumed = await client.request(
-          "session.resume",
-          { session_id: tail, omit_messages: false, ...scope },
-          SESSION_RPC_TIMEOUT_MS
-        );
-        return rememberSession(sessionKey, resumed);
-      } catch (err) {
-        log(`[hermes-agent] resume of "${tail}" failed, creating a new session: ${errorMessage(err)}`);
+  const storedSessions = (agentId) => {
+    if (storedLoads.has(agentId)) return storedLoads.get(agentId);
+    const load = (async () => {
+      const profile = profileForAgent(agentId);
+      let limit = 200;
+      for (;;) {
+        const result = await client.request("session.list", {
+          limit, ...(profile ? { profile } : {}),
+        });
+        if (!Array.isArray(result?.sessions)) throw new Error("Hermes returned an invalid session list.");
+        // session.list has no offset. Grow the window so a pinned older session
+        // cannot be mistaken for a deleted record.
+        if (result.sessions.length < limit) return result.sessions.filter((row) => asString(row?.id));
+        limit *= 2;
       }
-    }
+    })();
+    storedLoads.set(agentId, load);
+    load.finally(() => storedLoads.delete(agentId)).catch(() => {});
+    return load;
+  };
 
-    const created = await client.request("session.create", scope, SESSION_RPC_TIMEOUT_MS);
-    log(`[hermes-agent] session for "${sessionKey}" -> profile "${profile || "(default)"}"`);
-    return rememberSession(sessionKey, created);
+  const selectMain = async (agentId, stored) => {
+    const key = `agent:${agentId}:${MAIN_KEY}`;
+    const current = sessions.get(key);
+    if (current) return current;
+    const saved = selections.get(agentId);
+    const pinned = stored.find((row) => row.id === saved?.storedId
+      || row._lineage_root_id === saved?.storedId
+      || (saved?.lineageRootId && row._lineage_root_id === saved.lineageRootId));
+    // Hermes mints draft keys before writing a DB row. Keep an explicitly new,
+    // unsubmitted main empty across restart rather than reverting to old history.
+    if (!pinned && saved?.draft && saved.storedId) {
+      const entry = { storedId: saved.storedId, draft: true, title: "" };
+      sessions.set(key, entry);
+      return entry;
+    }
+    // Rank sources only for an unpinned/deleted selection. Within each category,
+    // preserve Hermes' last-activity order, not started_at order.
+    const selected = pinned || selectInitialSession(stored);
+    if (!selected) return null;
+    const entry = {
+      storedId: selected.id, title: asString(selected.title),
+      lineageRootId: asString(selected._lineage_root_id) || selected.id,
+      model: asString(selected.model), provider: canonicalModelProvider(selected.provider),
+    };
+    selections.set(agentId, { storedId: entry.storedId, lineageRootId: entry.lineageRootId });
+    sessions.set(key, entry);
+    return entry;
+  };
+
+  const ensureSession = (sessionKey, create = true) => {
+    if (sessionLoads.has(sessionKey)) return sessionLoads.get(sessionKey);
+    const load = (async () => {
+      const { agentId, tail } = parseSessionKey(sessionKey);
+      const profile = profileForAgent(agentId);
+      const scope = profile ? { profile } : {};
+      let entry = sessions.get(sessionKey);
+      if (entry?.runtimeId) return entry;
+      const stored = await storedSessions(agentId);
+      if (tail === MAIN_KEY) {
+        entry = await selectMain(agentId, stored);
+      } else {
+        const row = stored.find((candidate) => candidate.id === tail || candidate._lineage_root_id === tail);
+        if (!row) throw new Error(`Stored session not found in profile "${agentId}": ${tail}`);
+        entry = { storedId: row.id, title: asString(row.title) };
+      }
+      if (entry?.draft && !create) return null;
+      if (entry?.storedId) {
+        const resumed = await client.request("session.resume", {
+          session_id: entry.storedId, lazy: !entry.draft, omit_messages: true, ...scope,
+        }, SESSION_RPC_TIMEOUT_MS);
+        const remembered = rememberSession(sessionKey, { title: entry.title, ...resumed, lineageRootId: entry.lineageRootId, stored_session_id: asString(resumed?.session_key, entry.storedId) });
+        if (tail === MAIN_KEY) selections.set(agentId, { storedId: remembered.storedId, lineageRootId: remembered.lineageRootId, ...(entry.draft ? { draft: true } : {}) });
+        return remembered;
+      }
+      if (!create) return null;
+      const created = await client.request("session.create", scope, SESSION_RPC_TIMEOUT_MS);
+      const remembered = rememberSession(sessionKey, created);
+      if (tail === MAIN_KEY) selections.set(agentId, { storedId: remembered.storedId, draft: true });
+      log(`[hermes-agent] session for "${sessionKey}" -> profile "${profile || "(default)"}"`);
+      return remembered;
+    })();
+    sessionLoads.set(sessionKey, load);
+    load.finally(() => sessionLoads.delete(sessionKey)).catch(() => {});
+    return load;
   };
 
   // --- upstream event fan-out ----------------------------------------------
@@ -581,12 +688,10 @@ function createHermesAgentUpstream(options) {
         return resOk(id, {
           defaultId: defaultAgentId,
           mainKey: MAIN_KEY,
-          agents: agentRoster.map(({ id: agentId, name, workspace, identity, role }) => ({
-            id: agentId,
-            name,
-            workspace,
-            identity,
-            role,
+          agents: agentRoster.map((agent) => ({
+            id: agent.id, name: agent.name, workspace: agent.workspace,
+            identity: agent.identity, role: agent.role,
+            ...(agent.model ? { model: `${canonicalModelProvider(agent.provider || "")}/${agent.model}` } : {}),
           })),
         });
 
@@ -613,33 +718,27 @@ function createHermesAgentUpstream(options) {
         // be read per agent; they're local SQLite reads, so fan out in parallel.
         const perAgent = await Promise.all(
           agentRoster.map(async (agent) => {
-            const profile = asString(agent.profile);
-            let stored = [];
-            try {
-              const result = await client.request("session.list", {
-                limit: 20,
-                ...(profile ? { profile } : {}),
-              });
-              stored = Array.isArray(result?.sessions) ? result.sessions : [];
-            } catch (err) {
-              log(`[hermes-agent] session.list for "${agent.id}" failed: ${errorMessage(err)}`);
-            }
+            const stored = await storedSessions(agent.id);
+            const main = await selectMain(agent.id, stored);
             return [
               {
                 key: `agent:${agent.id}:${MAIN_KEY}`,
                 agentId: agent.id,
-                updatedAt: Date.now(),
-                displayName: "Main",
-                origin: { label: agent.name, provider: "hermes" },
-                modelProvider: "hermes",
+                updatedAt: null,
+                displayName: main?.title ? `Main · ${main.title}` : "Main",
+                storedSessionId: main?.storedId,
+                origin: { label: agent.name, provider: canonicalModelProvider(agent.provider || "") },
+                model: sessions.get(`agent:${agent.id}:${MAIN_KEY}`)?.model || agent.model || undefined,
+                modelProvider: sessions.get(`agent:${agent.id}:${MAIN_KEY}`)?.provider || canonicalModelProvider(agent.provider || "") || undefined,
               },
-              ...stored.map((s) => ({
+              ...stored.filter((s) => s.id !== main?.storedId).map((s) => ({
                 key: `agent:${agent.id}:${asString(s.id)}`,
                 agentId: agent.id,
                 updatedAt: typeof s.started_at === "number" ? s.started_at * 1000 : null,
                 displayName: asString(s.title, "Session"),
-                origin: { label: agent.name, provider: "hermes" },
-                modelProvider: "hermes",
+                origin: { label: agent.name, provider: canonicalModelProvider(s.provider || agent.provider || "") },
+                model: sessions.get(`agent:${agent.id}:${asString(s.id)}`)?.model || asString(s.model) || undefined,
+                modelProvider: sessions.get(`agent:${agent.id}:${asString(s.id)}`)?.provider || canonicalModelProvider(s.provider || agent.provider || "") || undefined,
               })),
             ];
           })
@@ -653,11 +752,12 @@ function createHermesAgentUpstream(options) {
         const maxChars = typeof p.maxChars === "number" ? p.maxChars : 240;
         const previews = await Promise.all(
           keys.map(async (key) => {
-            const entry = sessions.get(key);
-            if (!entry?.runtimeId) return { key, status: "empty", items: [] };
             try {
+              const entry = await ensureSession(key, false);
+              if (!entry) return { key, status: "empty", items: [] };
               const history = await client.request("session.history", {
                 session_id: entry.runtimeId,
+                ...(profileForAgent(parseSessionKey(key).agentId) ? { profile: profileForAgent(parseSessionKey(key).agentId) } : {}),
               });
               const items = toHermes3dMessages(history?.messages)
                 .slice(-limit)
@@ -667,8 +767,8 @@ function createHermesAgentUpstream(options) {
                   timestamp: Date.now(),
                 }));
               return { key, status: items.length ? "ok" : "empty", items };
-            } catch {
-              return { key, status: "empty", items: [] };
+            } catch (err) {
+              return { key, status: "error", error: errorMessage(err), items: [] };
             }
           })
         );
@@ -678,37 +778,51 @@ function createHermesAgentUpstream(options) {
       case "sessions.patch": {
         const key = asString(p.key, defaultMainKey());
         const model = typeof p.model === "string" ? p.model.trim() : "";
+        let resolved;
         if (model) {
-          try {
-            const entry = await ensureSession(key);
-            await client.request("config.set", {
-              key: "model",
-              value: model,
-              session_id: entry.runtimeId,
-            });
-          } catch (err) {
-            log(`[hermes-agent] model switch failed: ${errorMessage(err)}`);
+          const { agentId } = parseSessionKey(key);
+          const agent = agentRoster.find((candidate) => candidate.id === agentId);
+          const profile = asString(agent?.profile);
+          const entry = await ensureSession(key);
+          const inventory = await client.request("model.options", { ...(profile ? { profile } : {}), session_id: entry.runtimeId });
+          const rows = getModelRows(inventory);
+          const choice = parseModelRef(model, rows);
+          if (!choice) return resErr(id, "hermes_agent.invalid_model", `Unknown model: ${model}`);
+          const result = await client.request("config.set", {
+            key: "model", value: modelSwitchValue(choice.provider, choice.id),
+            session_id: entry.runtimeId, ...(profile ? { profile } : {}), scope: "session",
+          });
+          if (result?.confirm_required || result?.deferred) {
+            return resErr(id, "hermes_agent.model_not_applied", asString(result?.confirm_message || result?.warning, "Model switch was not applied."));
           }
+          const actual = await client.request("model.options", { ...(profile ? { profile } : {}), session_id: entry.runtimeId });
+          resolved = resultingModel(actual?.model, actual?.provider, rows);
+          if (!resolved || resolved.id !== choice.id || resolved.provider !== choice.provider) {
+            return resErr(id, "hermes_agent.model_not_applied", "Hermes did not activate the requested model.");
+          }
+          entry.model = resolved.id;
+          entry.provider = resolved.provider;
         }
         return resOk(id, {
-          ok: true,
-          key,
-          entry: { thinkingLevel: p.thinkingLevel },
-          resolved: { model: model || undefined, modelProvider: "hermes" },
+          ok: true, key, entry: { thinkingLevel: p.thinkingLevel },
+          ...(resolved ? { resolved: { model: resolved.id, modelProvider: resolved.provider } } : {}),
         });
       }
 
       case "sessions.reset": {
         const key = asString(p.key, defaultMainKey());
-        const entry = sessions.get(key);
-        if (entry?.runtimeId) {
-          sessionKeyByRuntimeId.delete(entry.runtimeId);
-          try {
-            await client.request("session.close", { session_id: entry.runtimeId });
-          } catch {}
-        }
-        sessions.delete(key);
-        return resOk(id, { ok: true });
+        const { agentId } = parseSessionKey(key);
+        const profile = profileForAgent(agentId);
+        // Serialize with in-flight hydration. Never close a resumed conversation:
+        // other Hermes clients may still be attached to it.
+        if (sessionLoads.has(key)) await sessionLoads.get(key);
+        const created = await client.request("session.create", profile ? { profile } : {}, SESSION_RPC_TIMEOUT_MS);
+        const mainKey = `agent:${agentId}:${MAIN_KEY}`;
+        const previous = sessions.get(mainKey);
+        const entry = rememberSession(mainKey, created);
+        selections.set(agentId, { storedId: entry.storedId, draft: true });
+        if (previous?.runtimeId) sessionKeyByRuntimeId.delete(previous.runtimeId);
+        return resOk(id, { ok: true, key: mainKey, storedSessionId: entry.storedId });
       }
 
       case "chat.send": {
@@ -730,6 +844,8 @@ function createHermesAgentUpstream(options) {
 
         try {
           await client.request("prompt.submit", { session_id: entry.runtimeId, text });
+          const { agentId, tail } = parseSessionKey(sessionKey);
+          if (tail === MAIN_KEY && entry.storedId) selections.set(agentId, { storedId: entry.storedId, lineageRootId: entry.lineageRootId });
         } catch (err) {
           activeRuns.delete(runId);
           runBySessionKey.delete(sessionKey);
@@ -765,16 +881,17 @@ function createHermesAgentUpstream(options) {
 
       case "chat.history": {
         const sessionKey = asString(p.sessionKey, defaultMainKey());
-        const entry = sessions.get(sessionKey);
-        if (!entry?.runtimeId) return resOk(id, { sessionKey, messages: [] });
         try {
+          const entry = await ensureSession(sessionKey, false);
+          if (!entry) return resOk(id, { sessionKey, messages: [] });
           const history = await client.request("session.history", {
             session_id: entry.runtimeId,
+            ...(profileForAgent(parseSessionKey(sessionKey).agentId) ? { profile: profileForAgent(parseSessionKey(sessionKey).agentId) } : {}),
           });
           return resOk(id, { sessionKey, messages: toHermes3dMessages(history?.messages) });
         } catch (err) {
           log(`[hermes-agent] session.history failed: ${errorMessage(err)}`);
-          return resOk(id, { sessionKey, messages: [] });
+          return resErr(id, "hermes_agent.history_failed", errorMessage(err));
         }
       }
 
@@ -810,17 +927,33 @@ function createHermesAgentUpstream(options) {
       }
 
       case "models.list": {
-        try {
-          const result = await client.request("model.options", {});
-          const options = Array.isArray(result?.options) ? result.options : [];
-          const models = options
-            .map((o) => asString(o?.id) || asString(o?.slug) || asString(o?.model))
-            .filter(Boolean)
-            .map((modelId) => ({ id: modelId, name: modelId }));
-          return resOk(id, { models: models.length ? models : [{ id: "hermes", name: "hermes" }] });
-        } catch {
-          return resOk(id, { models: [{ id: "hermes", name: "hermes" }] });
+        const inventories = await Promise.all(agentRoster.map(async (agent) => {
+          const profile = asString(agent.profile);
+          try {
+            return { agent, result: await client.request("model.options", { ...(profile ? { profile } : {}) }) };
+          } catch (err) {
+            return { agent, error: err };
+          }
+        }));
+        const union = new Map();
+        const failures = [];
+        for (const { agent, result, error } of inventories) {
+          if (error) {
+            failures.push(`${agent.id}: ${errorMessage(error)}`);
+            continue;
+          }
+          const providers = Array.isArray(result?.providers) ? result.providers : [];
+          for (const provider of providers) {
+            for (const row of getModelRows({ providers: [provider] })) {
+              const key = `${row.provider}/${row.id}`;
+              const existing = union.get(key);
+              if (existing) existing.agentIds.push(agent.id);
+              else union.set(key, { ...row, agentIds: [agent.id] });
+            }
+          }
         }
+        if (failures.length) return resErr(id, "hermes_agent.models_unavailable", failures.join("; "));
+        return resOk(id, { models: [...union.values()] });
       }
 
       case "skills.status": {

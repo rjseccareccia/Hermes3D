@@ -55,7 +55,8 @@ const startFakeHermesAgent = async (handlers: Record<string, RpcHandler>) => {
     ws.on("message", (raw) => {
       const request = JSON.parse(String(raw)) as Frame;
       received.push(request);
-      const handler = handlers[String(request.method)];
+      const method = String(request.method);
+      const handler = handlers[method] || (method === "session.list" ? () => ({ sessions: [] }) : undefined);
       if (!handler) {
         send({
           jsonrpc: "2.0",
@@ -64,8 +65,12 @@ const startFakeHermesAgent = async (handlers: Record<string, RpcHandler>) => {
         });
         return;
       }
-      const result = handler((request.params ?? {}) as Frame, emit);
-      send({ jsonrpc: "2.0", id: request.id, result: result ?? {} });
+      try {
+        const result = handler((request.params ?? {}) as Frame, emit);
+        send({ jsonrpc: "2.0", id: request.id, result: result ?? {} });
+      } catch (error) {
+        send({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: error instanceof Error ? error.message : String(error) } });
+      }
     });
   });
 
@@ -99,6 +104,14 @@ const openBridge = async (url: string, token = "") => {
   };
 
   return { upstream, frames, send, waitFor };
+};
+
+const connectBridge = async (bridge: {
+  send: (frame: Frame) => void;
+  waitFor: (predicate: (frame: Frame) => boolean, label: string) => Promise<Frame>;
+}) => {
+  bridge.send({ type: "req", id: "test-connect", method: "connect", params: {} });
+  await bridge.waitFor((frame) => frame.type === "res" && frame.id === "test-connect", "connect");
 };
 
 describe("buildJsonRpcUrl", () => {
@@ -241,7 +254,7 @@ describe("profiles as agents", () => {
   const backendProfiles = [
     {
       name: "default",
-      path: "/Users/lukeai1/.hermes",
+      path: "/Users/example/.hermes",
       is_default: true,
       model: "claude-haiku-4-5-20251001",
       description: "",
@@ -249,19 +262,19 @@ describe("profiles as agents", () => {
     },
     {
       name: "allan",
-      path: "/Users/lukeai1/.hermes/profiles/allan",
+      path: "/Users/example/.hermes/profiles/allan",
       is_default: false,
       model: "claude-haiku-4-5-20251001",
       description:
-        "Allan — technical planner and business systems analyst for Smartways. Converts Jira tickets into plans.",
+        "Allan — technical planner and business systems analyst for Example Co. Converts Jira tickets into plans.",
       display_name: "",
     },
     {
       name: "andrew",
-      path: "/Users/lukeai1/.hermes/profiles/andrew",
+      path: "/Users/example/.hermes/profiles/andrew",
       is_default: false,
       model: "claude-opus-4-8",
-      description: "Andrew — senior full-stack software developer for Smartways.",
+      description: "Andrew — senior full-stack software developer for Example Co.",
       display_name: "",
     },
   ];
@@ -541,7 +554,7 @@ describe("hermes-agent bridge", () => {
     expect(agent.received.some((frame) => frame.method === "session.interrupt")).toBe(true);
   });
 
-  it("surfaces stored hermes-agent sessions alongside the main key", async () => {
+  it("surfaces the selected stored hermes-agent session as the main alias", async () => {
     const agent = await startFakeHermesAgent({
       "session.list": () => ({
         sessions: [{ id: "20260409_abc", title: "Yesterday's chat", started_at: 1000 }],
@@ -552,10 +565,9 @@ describe("hermes-agent bridge", () => {
     bridge.send({ type: "req", id: "s1", method: "sessions.list", params: {} });
     const res = await bridge.waitFor((f) => f.type === "res" && f.id === "s1", "sessions.list");
 
-    const sessions = at(res, "payload.sessions") as { key: string }[];
-    expect(sessions.map((session) => session.key)).toEqual(
-      expect.arrayContaining(["agent:hermes:main", "agent:hermes:20260409_abc"]),
-    );
+    const sessions = at(res, "payload.sessions") as Frame[];
+    expect(sessions.map((session) => session.key)).toEqual(["agent:hermes:main"]);
+    expect(sessions[0]).toMatchObject({ storedSessionId: "20260409_abc", displayName: "Main · Yesterday's chat" });
   });
 
   it("keeps working when an optional upstream method is unavailable", async () => {
@@ -565,7 +577,191 @@ describe("hermes-agent bridge", () => {
     bridge.send({ type: "req", id: "k1", method: "models.list", params: {} });
     const res = await bridge.waitFor((f) => f.type === "res" && f.id === "k1", "models.list");
 
-    expect(res.ok).toBe(true);
-    expect(at(res, "payload.models")).not.toHaveLength(0);
+    expect(res.ok).toBe(false);
+    expect(at(res, "error.code")).toBe("hermes_agent.models_unavailable");
+  });
+
+  it("builds a profile-specific canonical model union with membership", async () => {
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({ profiles: [
+        { name: "default", is_default: true, model: "m1", provider: "Ollama-Cloud" },
+        { name: "coder", model: "m2", provider: "minimax" },
+      ] }),
+      "model.options": (params) => ({
+        providers: [{ slug: params.profile ? "minimax" : "ollama-cloud", models: ["m1", "shared"], capabilities: { shared: { reasoning: true, context_window: 8192 } } }],
+      }),
+    });
+    const bridge = await openBridge(agent.url);
+    await connectBridge(bridge);
+    bridge.send({ type: "req", id: "catalog", method: "models.list", params: {} });
+    const response = await bridge.waitFor((f) => f.type === "res" && f.id === "catalog", "catalog");
+    expect(response.ok).toBe(true);
+    expect(response.payload).toEqual({ models: expect.arrayContaining([
+      { provider: "ollama-cloud", id: "m1", name: "m1", agentIds: ["default"] },
+      { provider: "ollama-cloud", id: "shared", name: "shared", reasoning: true, contextWindow: 8192, agentIds: ["default"] },
+      { provider: "minimax", id: "shared", name: "shared", reasoning: true, contextWindow: 8192, agentIds: ["coder"] },
+    ]) });
+  });
+
+  it("reports model inventory RPC failures instead of fabricating fallback models", async () => {
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({ profiles: [{ name: "default", is_default: true }] }),
+      "model.options": () => { throw new Error("inventory offline"); },
+    });
+    const bridge = await openBridge(agent.url);
+    await connectBridge(bridge);
+    bridge.send({ type: "req", id: "catalog-error", method: "models.list", params: {} });
+    const response = await bridge.waitFor((f) => f.type === "res" && f.id === "catalog-error", "catalog error");
+    expect(response.ok).toBe(false);
+    expect(at(response, "error.message")).toContain("inventory offline");
+  });
+
+  it("switches only the selected session and keeps the profile default and other session unchanged", async () => {
+    let currentModel = "base";
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({ profiles: [{ name: "default", is_default: true, model: "base", provider: "ollama-cloud" }] }),
+      "session.list": () => ({ sessions: [
+        { id: "main-stored", model: "base", provider: "ollama-cloud" },
+        { id: "other", model: "unrelated", provider: "ollama-cloud" },
+      ] }),
+      "session.resume": () => ({ session_id: "runtime-1", session_key: "main-stored" }),
+      "model.options": (params) => ({
+        model: params.session_id ? currentModel : "base",
+        provider: "ollama-cloud",
+        providers: [{ slug: "ollama-cloud", models: ["base", "target"] }],
+      }),
+      "config.set": (params) => {
+        expect(params).toMatchObject({ key: "model", session_id: "runtime-1", scope: "session" });
+        expect(String(params.value).split(/\s+/)).toEqual(["target", "--provider", "ollama-cloud", "--session"]);
+        currentModel = "target";
+        return { key: "model", value: "target" };
+      },
+    });
+    const bridge = await openBridge(agent.url);
+    await connectBridge(bridge);
+    bridge.send({ type: "req", id: "switch", method: "sessions.patch", params: { key: "agent:default:main", model: "ollama-cloud/target" } });
+    const response = await bridge.waitFor((f) => f.type === "res" && f.id === "switch", "switch");
+    expect(response.ok).toBe(true);
+    expect(at(response, "payload.resolved")).toEqual({ model: "target", modelProvider: "ollama-cloud" });
+
+    bridge.send({ type: "req", id: "agents-after-switch", method: "agents.list", params: {} });
+    const agents = await bridge.waitFor((f) => f.type === "res" && f.id === "agents-after-switch", "agents after switch");
+    expect(at(agents, "payload.agents.0.model")).toBe("ollama-cloud/base");
+
+    bridge.send({ type: "req", id: "sessions-after-switch", method: "sessions.list", params: {} });
+    const sessions = await bridge.waitFor((f) => f.type === "res" && f.id === "sessions-after-switch", "sessions after switch");
+    const sessionRows = at(sessions, "payload.sessions") as Frame[];
+    expect(sessionRows[0]).toMatchObject({ model: "target", modelProvider: "ollama-cloud" });
+    expect(sessionRows[1]).toMatchObject({ model: "unrelated", modelProvider: "ollama-cloud" });
+  });
+  it("does not report deferred or confirmation-required changes as applied", async () => {
+    for (const outcome of [{ deferred: true }, { confirm_required: true, confirm_message: "Confirm expensive model" }]) {
+      const agent = await startFakeHermesAgent({
+        "profiles.list": () => ({ profiles: [{ name: "default", is_default: true }] }),
+        "session.create": () => ({ session_id: "runtime-1" }),
+        "model.options": () => ({ model: "old", provider: "ollama-cloud", providers: [{ slug: "ollama-cloud", models: ["target"] }] }),
+        "config.set": () => outcome,
+      });
+      const bridge = await openBridge(agent.url);
+      await connectBridge(bridge);
+      bridge.send({ type: "req", id: `switch-${Object.keys(outcome)[0]}`, method: "sessions.patch", params: { key: "agent:default:main", model: "ollama-cloud/target" } });
+      const response = await bridge.waitFor((f) => f.type === "res" && String(f.id).startsWith("switch-"), "switch refusal");
+      expect(response.ok).toBe(false);
+      expect(at(response, "error.code")).toBe("hermes_agent.model_not_applied");
+    }
+  });
+
+  it("unions multiple providers and models while deduplicating shared entries by profile", async () => {
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({ profiles: [{ name: "default", is_default: true }, { name: "coder" }] }),
+      "model.options": (params) => params.profile
+        ? { providers: [{ slug: "openai", models: ["gpt-a", "gpt-b"] }, { slug: "minimax", models: ["shared"] }] }
+        : { providers: [{ slug: "openai", models: ["gpt-a", "gpt-b"] }, { slug: "anthropic", models: ["claude"] }] },
+    });
+    const bridge = await openBridge(agent.url);
+    await connectBridge(bridge);
+    bridge.send({ type: "req", id: "union", method: "models.list", params: {} });
+    const response = await bridge.waitFor((f) => f.type === "res" && f.id === "union", "model union");
+    const models = at(response, "payload.models") as Frame[];
+    expect(models).toEqual(expect.arrayContaining([
+      { provider: "openai", id: "gpt-a", name: "gpt-a", agentIds: ["default", "coder"] },
+      { provider: "openai", id: "gpt-b", name: "gpt-b", agentIds: ["default", "coder"] },
+      { provider: "anthropic", id: "claude", name: "claude", agentIds: ["default"] },
+      { provider: "minimax", id: "shared", name: "shared", agentIds: ["coder"] },
+    ]));
+  });
+
+  it("returns an empty catalog when inventories contain no configured models", async () => {
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({ profiles: [{ name: "default", is_default: true }] }),
+      "model.options": () => ({ providers: [{ slug: "openai", models: [] }] }),
+    });
+    const bridge = await openBridge(agent.url);
+    await connectBridge(bridge);
+    bridge.send({ type: "req", id: "empty", method: "models.list", params: {} });
+    const response = await bridge.waitFor((f) => f.type === "res" && f.id === "empty", "empty catalog");
+    expect(response.payload).toEqual({ models: [] });
+  });
+
+  it("rejects a model switch when config.set fails", async () => {
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({ profiles: [{ name: "default", is_default: true }] }),
+      "session.create": () => ({ session_id: "runtime-1" }),
+      "model.options": () => ({ model: "old", provider: "openai", providers: [{ slug: "openai", models: ["target"] }] }),
+      "config.set": () => { throw new Error("setter refused"); },
+    });
+    const bridge = await openBridge(agent.url);
+    await connectBridge(bridge);
+    bridge.send({ type: "req", id: "set-error", method: "sessions.patch", params: { key: "agent:default:main", model: "openai/target" } });
+    const response = await bridge.waitFor((f) => f.type === "res" && f.id === "set-error", "setter error");
+    expect(response.ok).toBe(false);
+    expect(at(response, "error.message")).toContain("setter refused");
+  });
+
+  it("exposes profile model/provider in agents.list and session model/provider", async () => {
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({ profiles: [{ name: "default", is_default: true, model: "m1", provider: "openai" }] }),
+      "session.list": () => ({ sessions: [{ id: "stored", title: "Saved", model: "m2", provider: "anthropic" }] }),
+    });
+    const bridge = await openBridge(agent.url);
+    await connectBridge(bridge);
+    bridge.send({ type: "req", id: "agents", method: "agents.list", params: {} });
+    const agents = await bridge.waitFor((f) => f.type === "res" && f.id === "agents", "agents");
+    expect(at(agents, "payload.agents.0.model")).toBe("openai/m1");
+    bridge.send({ type: "req", id: "sessions-models", method: "sessions.list", params: {} });
+    const sessions = await bridge.waitFor((f) => f.type === "res" && f.id === "sessions-models", "sessions");
+    expect(at(sessions, "payload.sessions.0.model")).toBe("m2");
+    expect(at(sessions, "payload.sessions.0.modelProvider")).toBe("anthropic");
+    expect(`${at(sessions, "payload.sessions.0.modelProvider")}/${at(sessions, "payload.sessions.0.model")}`).toBe("anthropic/m2");
+  });
+  it("rejects unknown provider/model selections without calling config.set", async () => {
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({ profiles: [{ name: "default", is_default: true }] }),
+      "session.create": () => ({ session_id: "runtime-1" }),
+      "model.options": () => ({ providers: [{ slug: "openai", models: ["known"] }] }),
+      "config.set": () => { throw new Error("must not be called"); },
+    });
+    const bridge = await openBridge(agent.url);
+    await connectBridge(bridge);
+    bridge.send({ type: "req", id: "invalid", method: "sessions.patch", params: { key: "agent:default:main", model: "other/missing" } });
+    const response = await bridge.waitFor((f) => f.type === "res" && f.id === "invalid", "invalid selection");
+    expect(response.ok).toBe(false);
+    expect(at(response, "error.code")).toBe("hermes_agent.invalid_model");
+    expect(agent.received.some((frame) => frame.method === "config.set")).toBe(false);
+  });
+
+  it("rejects a successful setter response if the live session did not change", async () => {
+    const agent = await startFakeHermesAgent({
+      "profiles.list": () => ({ profiles: [{ name: "default", is_default: true }] }),
+      "session.create": () => ({ session_id: "runtime-1" }),
+      "model.options": () => ({ model: "old", provider: "openai", providers: [{ slug: "openai", models: ["target"] }] }),
+      "config.set": () => ({ key: "model", value: "target" }),
+    });
+    const bridge = await openBridge(agent.url);
+    await connectBridge(bridge);
+    bridge.send({ type: "req", id: "unchanged", method: "sessions.patch", params: { key: "agent:default:main", model: "openai/target" } });
+    const response = await bridge.waitFor((f) => f.type === "res" && f.id === "unchanged", "unchanged model");
+    expect(response.ok).toBe(false);
+    expect(at(response, "error.code")).toBe("hermes_agent.model_not_applied");
   });
 });
