@@ -8,6 +8,16 @@
 - Keep New Session scoped to the selected profile, preserve older conversations, and hide the selected stored session's duplicate list entry. Unsubmitted drafts remain empty across reconnects; transcripts stay exclusively in Hermes.
 - Hydrate the Office chat transcript on opening an agent, using the existing canonical history-sync operation rather than waiting for a new run event.
 - Prefer interactive Hermes session sources when selecting an unpinned main or replacing a deleted selection. Valid pins and New Session drafts remain authoritative; API/unknown-provenance sessions cannot outrank recognized chat surfaces. Preserve Hermes activity order within each source category.
+- Release a session's run lock when the adapter that launched the run closes, so a dropped browser or finished team call cannot leave the session blocked until restart.
+- Report exact run outcomes from `agent.wait` (`completed` with response, or `error`), keep the completed-run registry bounded (256 entries, 10-minute TTL for finished runs), and reject overlapping sends to one backend session with `hermes_agent.run_in_progress`.
+
+### Added
+
+- Lucy team orchestration: `team_roster`, `team_delegate`, `team_delegate_many`, and `team_message` tools (`server/hermes-team-mcp.mjs`) backed by the Studio `/api/team` routes. Each delegated run is correlated by run ID and must report a session belonging to the target agent; a failed or slow target does not discard other targets' results.
+
+### Security
+
+- `/api/team/*` requires `HERMES3D_TEAM_TOKEN` as a bearer token, separate from the Hermes gateway token. Missing tokens are rejected with 401, wrong tokens with 403, and an unset server token fails closed with 503. The Lucy MCP reads its token from a file (`HERMES3D_TEAM_TOKEN_FILE`) and never prints it.
 
 ## [0.1.4] - 2026-04-23
 

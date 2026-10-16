@@ -266,6 +266,47 @@ Common environment variables:
 
 See [`.env.example`](.env.example) for the full local development template.
 
+### Lucy team MCP server
+
+The standalone stdio MCP server exposes `team_roster`, `team_delegate`,
+`team_delegate_many`, and `team_message` for Lucy's profile. It forwards
+requests to the Studio `/api/team` API; it does not contain or expose gateway
+credentials. Configure it only in Lucy's profile-local MCP configuration (not
+the shared/root configuration inherited by target agent profiles), for example:
+
+```json
+{
+  "mcp_servers": {
+    "hermes-team": {
+      "command": "node",
+      "args": ["/path/to/hermes3d/server/hermes-team-mcp.mjs"],
+      "env": {
+        "HERMES_TEAM_API_URL": "http://10.0.0.20:3004",
+        "HERMES_TEAM_AGENT_ID": "default",
+        "HERMES3D_TEAM_TOKEN_FILE": "/home/you/.config/hermes3d/team-token"
+      }
+    }
+  }
+}
+```
+
+The default API URL is `http://10.0.0.20:3004`; override it when Hermes3D's
+HTTP API is reachable at another address. `HERMES_TEAM_AGENT_ID` defaults to
+`default` (the Lucy profile's agent ID) and prevents self-delegation/self-messaging.
+JSON-RPC over stdin/stdout; keep stdout reserved for protocol messages.
+
+The team API requires a bearer token. Set `HERMES3D_TEAM_TOKEN` in Studio's
+environment (it must differ from `HERMES3D_GATEWAY_TOKEN`) and give the MCP the
+same value through `HERMES3D_TEAM_TOKEN_FILE`, a file readable only by the
+Hermes user. Every `/api/team` request is checked server-side: no token returns
+401, a wrong token returns 403, and an unset `HERMES3D_TEAM_TOKEN` fails closed
+with 503. The token is never returned by a route, logged, or passed to the model.
+
+Use `team_roster` to select an appropriate specialist. Delegate only substantive
+work, provide enough context for each agent to work independently, and use
+`team_delegate_many` only for independent parallel assignments. Wait for and
+review all run results before synthesizing them.
+
 ## Scripts
 
 - `npm run dev` starts the Studio dev server.

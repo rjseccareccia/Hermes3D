@@ -1,4 +1,4 @@
-import { buildAgentMainSessionKey, parseAgentIdFromSessionKey } from "@/lib/gateway/GatewayClient";
+import { buildAgentMainSessionKey, parseAgentIdFromSessionKey } from "@/lib/gateway/sessionKeys";
 import { buildAgentInstruction } from "@/lib/text/message-extract";
 import { randomUUID } from "@/lib/uuid";
 

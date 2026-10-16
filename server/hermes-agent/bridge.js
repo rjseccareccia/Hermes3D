@@ -39,6 +39,28 @@ const MAIN_SESSION_KEY = `agent:${AGENT_ID}:${MAIN_KEY}`;
 
 /** hermes-agent's `session.create` / `session.resume` can be slow on a cold profile. */
 const SESSION_RPC_TIMEOUT_MS = 60_000;
+/** Run results and session locks outlive individual browser WebSocket adapters. */
+const sharedRuns = new Map();
+const activeSessionRuns = new Map();
+const runEventListeners = new Map();
+const MAX_COMPLETED_RUNS = 256;
+const RUN_RESULT_TTL_MS = 10 * 60_000;
+
+const retainRunResult = (key, value) => {
+  sharedRuns.set(key, value);
+  const now = Date.now();
+  for (const [entryKey, result] of sharedRuns) {
+    if (result.status !== "running" && now - (result.atMs ?? 0) > RUN_RESULT_TTL_MS) {
+      sharedRuns.delete(entryKey);
+    }
+  }
+  while (sharedRuns.size > MAX_COMPLETED_RUNS) {
+    const completed = [...sharedRuns].find(([, result]) => result.status !== "running");
+    if (!completed) break;
+    sharedRuns.delete(completed[0]);
+  }
+};
+
 
 /**
  * The slice of the `ws` WebSocket surface `gateway-proxy.js` relies on.
@@ -296,13 +318,22 @@ function createHermesAgentUpstream(options) {
   let defaultAgentId = AGENT_ID;
   /** Optional feed of turns driven from other clients; see ./office-speech.js. */
   let officeSpeech = null;
-  /** runId -> { sessionKey, runtimeId, buffer, aborted } */
+  /** runId -> { sessionKey, runtimeId, buffer, aborted, registryKey, lockKey } */
   const activeRuns = new Map();
   /** sessionKey -> runId, so session-scoped events find their run. */
   const runBySessionKey = new Map();
 
   let seq = 0;
   let closed = false;
+  let runListeners = runEventListeners.get(url);
+  if (!runListeners) {
+    runListeners = new Set();
+    runEventListeners.set(url, runListeners);
+  }
+  const receiveRunEvent = (event, payload) => {
+    if (!closed) upstream.emit("message", JSON.stringify({ type: "event", event, seq: seq++, payload }));
+  };
+  runListeners.add(receiveRunEvent);
 
   const emitFrame = (frame) => {
     if (closed) return;
@@ -313,8 +344,12 @@ function createHermesAgentUpstream(options) {
     emitFrame({ type: "event", event, seq: seq++, payload });
   };
 
+  const emitRunEvent = (event, payload) => {
+    for (const listener of runListeners) listener(event, payload);
+  };
+
   const emitChat = (runId, sessionKey, state, extra) => {
-    emitEvent("chat", { runId, sessionKey, state, ...extra });
+    emitRunEvent("chat", { runId, sessionKey, state, ...extra });
   };
 
   // --- session mapping ------------------------------------------------------
@@ -484,26 +519,31 @@ function createHermesAgentUpstream(options) {
         if (!run) return;
         const finalText =
           typeof payload?.text === "string" && payload.text ? payload.text : run.buffer;
-        if (run.aborted) {
-          emitChat(runId, sessionKey, "aborted", {});
-        } else if (payload?.status === "error" || payload?.error) {
-          emitChat(runId, sessionKey, "error", {
-            errorMessage: asString(payload?.error, "hermes-agent reported an error"),
-          });
-        } else {
+        const error = run.aborted ? "Run aborted" :
+          payload?.status === "error" || payload?.error
+            ? asString(payload?.error, "hermes-agent reported an error") : null;
+        const result = {
+          sessionKey,
+          status: error ? "error" : "completed",
+          ...(error ? { error } : { response: finalText }),
+          atMs: Date.now(),
+        };
+        retainRunResult(run.registryKey, result);
+        activeSessionRuns.delete(run.lockKey);
+        if (run.aborted) emitChat(runId, sessionKey, "aborted", {});
+        else if (error) emitChat(runId, sessionKey, "error", { errorMessage: error });
+        else {
           emitChat(runId, sessionKey, "final", {
             stopReason: "end_turn",
             message: { role: "assistant", content: finalText },
           });
-          emitEvent("presence", {
+          emitRunEvent("presence", {
             sessions: {
               recent: [{ key: sessionKey, updatedAt: Date.now() }],
-              byAgent: [
-                {
-                  agentId: parseSessionKey(sessionKey).agentId,
-                  recent: [{ key: sessionKey, updatedAt: Date.now() }],
-                },
-              ],
+              byAgent: [{
+                agentId: parseSessionKey(sessionKey).agentId,
+                recent: [{ key: sessionKey, updatedAt: Date.now() }],
+              }],
             },
           });
         }
@@ -514,7 +554,7 @@ function createHermesAgentUpstream(options) {
 
       case "tool.start":
         if (!run) return;
-        emitEvent("agent", {
+        emitRunEvent("agent", {
           runId,
           sessionKey,
           stream: "tool",
@@ -524,7 +564,7 @@ function createHermesAgentUpstream(options) {
 
       case "tool.complete":
         if (!run) return;
-        emitEvent("agent", {
+        emitRunEvent("agent", {
           runId,
           sessionKey,
           stream: "tool",
@@ -535,7 +575,7 @@ function createHermesAgentUpstream(options) {
       case "reasoning.delta":
       case "thinking.delta":
         if (!run) return;
-        emitEvent("agent", {
+        emitRunEvent("agent", {
           runId,
           sessionKey,
           stream: "reasoning",
@@ -545,7 +585,7 @@ function createHermesAgentUpstream(options) {
 
       case "status.update":
         if (!run) return;
-        emitEvent("agent", {
+        emitRunEvent("agent", {
           runId,
           sessionKey,
           stream: "lifecycle",
@@ -554,7 +594,7 @@ function createHermesAgentUpstream(options) {
         return;
 
       case "approval.request":
-        emitEvent("exec.approval.requested", {
+        emitRunEvent("exec.approval.requested", {
           id: asString(payload?.request_id),
           request: { command: asString(payload?.command), cwd: asString(payload?.cwd) },
           createdAtMs: Date.now(),
@@ -564,11 +604,14 @@ function createHermesAgentUpstream(options) {
 
       case "error":
         if (!run) return;
-        emitChat(runId, sessionKey, "error", {
-          errorMessage: asString(payload?.message, "hermes-agent reported an error"),
-        });
-        activeRuns.delete(runId);
-        runBySessionKey.delete(sessionKey);
+        {
+          const error = asString(payload?.message, "hermes-agent reported an error");
+          retainRunResult(run.registryKey, { sessionKey, status: "error", error, atMs: Date.now() });
+          activeSessionRuns.delete(run.lockKey);
+          emitChat(runId, sessionKey, "error", { errorMessage: error });
+          activeRuns.delete(runId);
+          runBySessionKey.delete(sessionKey);
+        }
         return;
 
       default:
@@ -831,6 +874,11 @@ function createHermesAgentUpstream(options) {
           typeof p.message === "string" ? p.message.trim() : String(p.message ?? "").trim();
         const runId = asString(p.idempotencyKey) || randomUUID();
         if (!text) return resOk(id, { status: "no-op", runId });
+        const registryKey = `${url}\n${runId}`;
+        const lockKey = `${url}\n${sessionKey}`;
+        if (activeSessionRuns.has(lockKey)) {
+          return resErr(id, "hermes_agent.run_in_progress", "A run is already active for this session.");
+        }
 
         let entry;
         try {
@@ -838,10 +886,14 @@ function createHermesAgentUpstream(options) {
         } catch (err) {
           return resErr(id, "hermes_agent.session_failed", errorMessage(err));
         }
-
-        activeRuns.set(runId, { sessionKey, runtimeId: entry.runtimeId, buffer: "", aborted: false });
+        if (activeSessionRuns.has(lockKey)) {
+          return resErr(id, "hermes_agent.run_in_progress", "A run is already active for this session.");
+        }
+        retainRunResult(registryKey, { sessionKey, status: "running" });
+        const run = { sessionKey, runtimeId: entry.runtimeId, buffer: "", aborted: false, registryKey, lockKey };
+        activeRuns.set(runId, run);
+        activeSessionRuns.set(lockKey, runId);
         runBySessionKey.set(sessionKey, runId);
-
         try {
           await client.request("prompt.submit", { session_id: entry.runtimeId, text });
           const { agentId, tail } = parseSessionKey(sessionKey);
@@ -849,9 +901,10 @@ function createHermesAgentUpstream(options) {
         } catch (err) {
           activeRuns.delete(runId);
           runBySessionKey.delete(sessionKey);
+          activeSessionRuns.delete(lockKey);
+          sharedRuns.set(registryKey, { sessionKey, status: "error", error: errorMessage(err), atMs: Date.now() });
           return resErr(id, "hermes_agent.prompt_failed", errorMessage(err));
         }
-
         return resOk(id, { status: "started", runId });
       }
 
@@ -897,13 +950,18 @@ function createHermesAgentUpstream(options) {
 
       case "agent.wait": {
         const runId = asString(p.runId);
+        const registryKey = `${url}\n${runId}`;
         const timeoutMs = typeof p.timeoutMs === "number" ? p.timeoutMs : 30_000;
         const start = Date.now();
-        while (activeRuns.has(runId) && Date.now() - start < timeoutMs) {
-          await new Promise((r) => setTimeout(r, 100));
+        while (sharedRuns.get(registryKey)?.status === "running" && Date.now() - start < timeoutMs) {
+          await new Promise((r) => setTimeout(r, 50));
         }
-        return resOk(id, { status: activeRuns.has(runId) ? "running" : "done" });
+        const result = sharedRuns.get(registryKey);
+        if (!result) return resOk(id, { status: "unknown" });
+        const { atMs, ...reported } = result;
+        return resOk(id, reported);
       }
+
 
       case "status": {
         const recent = [...sessions.keys()].map((key) => ({ key, updatedAt: Date.now() }));
@@ -1104,10 +1162,31 @@ function createHermesAgentUpstream(options) {
     officeSpeech = null;
   };
 
+  const stopRunEventForwarding = () => {
+    runListeners.delete(receiveRunEvent);
+    if (runListeners.size === 0) runEventListeners.delete(url);
+  };
+
+  /**
+   * A run's completion only reaches the adapter that submitted it. Once that
+   * adapter closes nothing here can finish the run, so release its session lock
+   * now instead of blocking the session until Hermes3D restarts.
+   */
+  const releaseOwnedRuns = (reason) => {
+    for (const [runId, run] of activeRuns) {
+      retainRunResult(run.registryKey, { sessionKey: run.sessionKey, status: "error", error: reason, atMs: Date.now() });
+      if (activeSessionRuns.get(run.lockKey) === runId) activeSessionRuns.delete(run.lockKey);
+      if (runBySessionKey.get(run.sessionKey) === runId) runBySessionKey.delete(run.sessionKey);
+    }
+    activeRuns.clear();
+  };
+
   upstream.close = (code, reason) => {
     closed = true;
     upstream.readyState = CLOSED;
     stopOfficeSpeech();
+    stopRunEventForwarding();
+    releaseOwnedRuns("Run connection closed before the run finished.");
     client.close(code, reason);
   };
 
@@ -1115,6 +1194,8 @@ function createHermesAgentUpstream(options) {
     closed = true;
     upstream.readyState = CLOSED;
     stopOfficeSpeech();
+    stopRunEventForwarding();
+    releaseOwnedRuns("Run connection closed before the run finished.");
     client.terminate();
   };
 
@@ -1128,6 +1209,8 @@ function createHermesAgentUpstream(options) {
     closed = true;
     upstream.readyState = CLOSED;
     stopOfficeSpeech();
+    stopRunEventForwarding();
+    releaseOwnedRuns("Run connection closed before the run finished.");
     upstream.emit("close", code, Buffer.from(String(reason ?? "")));
   });
 

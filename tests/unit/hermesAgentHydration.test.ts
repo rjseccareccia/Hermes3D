@@ -54,6 +54,7 @@ const open = async (url: string, selectionPath: string) => {
     upstream.once("error", reject);
   });
   const bridge = {
+    close: () => upstream.close(1000, "reconnect"),
     send: (frame: Frame) => upstream.send(JSON.stringify(frame)),
     async response(id: string) {
       const start = Date.now();
@@ -217,6 +218,7 @@ describe("persistent Hermes profile hydration", () => {
     await sendPrompt(bridge, "work", "agent:work:main");
     await request(bridge, "reset", "sessions.reset", { key: "agent:default:main" });
     expect(backend.requests.filter((r) => r.method === "session.create")).toHaveLength(1);
+    bridge.close();
     const reconnect = await open(backend.url, selectionPath);
     await sendPrompt(reconnect, "after");
     expect(backend.requests.filter((r) => r.method === "session.resume").at(-1)?.params).toMatchObject({ session_id: "new", lazy: false });
@@ -244,6 +246,7 @@ describe("persistent Hermes profile hydration", () => {
     const first = await open(backend.url, selectionPath);
     await request(first, "reset", "sessions.reset", { key: "agent:default:main" });
     await sendPrompt(first, "persist-new");
+    first.close();
     await sendPrompt(await open(backend.url, selectionPath), "reconnect-new");
     expect(backend.requests.filter((r) => r.method === "session.resume").at(-1)?.params).toMatchObject({ session_id: "new-main" });
   });

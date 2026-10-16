@@ -172,11 +172,7 @@ const withTimeout = async <T>(
   }
 };
 
-export const buildAgentMainSessionKey = (agentId: string, mainKey: string) => {
-  const trimmedAgent = agentId.trim();
-  const trimmedKey = mainKey.trim() || "main";
-  return `agent:${trimmedAgent}:${trimmedKey}`;
-};
+export { buildAgentMainSessionKey } from "@/lib/gateway/sessionKeys";
 
 export class NodeGatewayClient {
   private socket: WebSocket | null = null;

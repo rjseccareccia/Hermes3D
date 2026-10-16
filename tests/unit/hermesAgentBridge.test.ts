@@ -2,6 +2,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket as WsSocket } from "ws";
 import type { AddressInfo } from "node:net";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const { buildJsonRpcUrl, redactUrl } = await import("../../server/hermes-agent/jsonrpc-client");
 const { createHermesAgentUpstream, toHermes3dMessages } = await import(
@@ -81,7 +84,8 @@ const startFakeHermesAgent = async (handlers: Record<string, RpcHandler>) => {
 /** Drive the bridge and collect the frames it sends back toward the browser. */
 const openBridge = async (url: string, token = "") => {
   const frames: Frame[] = [];
-  const upstream = createHermesAgentUpstream({ url, token });
+  const sessionSelectionPath = join(mkdtempSync(join(tmpdir(), "hermes-bridge-test-")), "selection.json");
+  const upstream = createHermesAgentUpstream({ url, token, sessionSelectionPath });
   upstreams.push(upstream);
   upstream.on("message", (raw: string) => frames.push(JSON.parse(raw) as Frame));
 
@@ -511,7 +515,52 @@ describe("hermes-agent bridge", () => {
       (f) => f.event === "chat" && at(f, "payload.state") === "delta",
     );
     expect(deltas.map((frame) => at(frame, "payload.message.content"))).toEqual(["Hel", "Hello"]);
+
+    bridge.send({ type: "req", id: "w1", method: "agent.wait", params: { runId: "run-1" } });
+    const waited = await bridge.waitFor((f) => f.type === "res" && f.id === "w1", "agent.wait");
+    expect(waited.payload).toEqual({
+      sessionKey: "agent:hermes:main",
+      status: "completed",
+      response: "Hello",
+    });
+
+    const otherClient = await openBridge(agent.url);
+    otherClient.send({ type: "req", id: "w2", method: "agent.wait", params: { runId: "run-1" } });
+    const persisted = await otherClient.waitFor((f) => f.type === "res" && f.id === "w2", "persisted agent.wait");
+    expect(persisted.payload).toEqual(waited.payload);
   });
+
+  it("streams a run launched on one adapter to every other adapter on the backend", async () => {
+    const agent = await startFakeHermesAgent({
+      "session.create": () => ({ session_id: "s1" }),
+      "prompt.submit": (_params, emit) => {
+        setImmediate(() => {
+          emit("message.delta", { text: "Hi" });
+          emit("message.complete", { text: "Hi", status: "complete" });
+        });
+        return { status: "streaming" };
+      },
+    });
+    const launcher = await openBridge(agent.url);
+    const observer = await openBridge(agent.url);
+
+    launcher.send({
+      type: "req",
+      id: "o1",
+      method: "chat.send",
+      params: { sessionKey: "agent:hermes:main", message: "hi", idempotencyKey: "run-shared" },
+    });
+    await launcher.waitFor((f) => f.type === "res" && f.id === "o1", "chat.send res");
+
+    const seen = await observer.waitFor(
+      (f) => f.event === "chat" && at(f, "payload.state") === "final",
+      "final chat event on the second adapter",
+    );
+    expect(at(seen, "payload.runId")).toBe("run-shared");
+    expect(at(seen, "payload.sessionKey")).toBe("agent:hermes:main");
+    expect(at(seen, "payload.message")).toEqual({ role: "assistant", content: "Hi" });
+  });
+
 
   it("reports a failed prompt as an error response rather than a silent hang", async () => {
     const agent = await startFakeHermesAgent({
@@ -546,12 +595,52 @@ describe("hermes-agent bridge", () => {
       params: { sessionKey: "agent:hermes:main", message: "hi", idempotencyKey: "run-9" },
     });
     await bridge.waitFor((f) => f.type === "res" && f.id === "m3", "chat.send res");
+    bridge.send({
+      type: "req",
+      id: "m3-overlap",
+      method: "chat.send",
+      params: { sessionKey: "agent:hermes:main", message: "overlap" },
+    });
+    const overlap = await bridge.waitFor((f) => f.type === "res" && f.id === "m3-overlap", "overlapping send");
+    expect(overlap.ok).toBe(false);
+    expect(at(overlap, "error.code")).toBe("hermes_agent.run_in_progress");
+
 
     bridge.send({ type: "req", id: "a1", method: "chat.abort", params: { runId: "run-9" } });
     const res = await bridge.waitFor((f) => f.type === "res" && f.id === "a1", "abort res");
 
     expect(res.payload).toMatchObject({ ok: true, aborted: 1 });
     expect(agent.received.some((frame) => frame.method === "session.interrupt")).toBe(true);
+  });
+
+  it("releases the session when the adapter that launched its run closes", async () => {
+    const agent = await startFakeHermesAgent({
+      "session.create": () => ({ session_id: "s1" }),
+      "prompt.submit": () => ({ status: "streaming" }),
+    });
+    const launcher = await openBridge(agent.url);
+    launcher.send({
+      type: "req",
+      id: "orphan-send",
+      method: "chat.send",
+      params: { sessionKey: "agent:hermes:main", message: "hi", idempotencyKey: "run-orphan" },
+    });
+    await launcher.waitFor((f) => f.type === "res" && f.id === "orphan-send", "orphan send");
+    launcher.upstream.close(1000, "adapter closed");
+
+    const next = await openBridge(agent.url);
+    next.send({
+      type: "req",
+      id: "next-send",
+      method: "chat.send",
+      params: { sessionKey: "agent:hermes:main", message: "again", idempotencyKey: "run-next" },
+    });
+    const sent = await next.waitFor((f) => f.type === "res" && f.id === "next-send", "next send");
+    expect(sent.ok).toBe(true);
+
+    next.send({ type: "req", id: "orphan-wait", method: "agent.wait", params: { runId: "run-orphan", timeoutMs: 1000 } });
+    const wait = await next.waitFor((f) => f.type === "res" && f.id === "orphan-wait", "orphan wait");
+    expect(wait.payload).toMatchObject({ status: "error", sessionKey: "agent:hermes:main" });
   });
 
   it("surfaces the selected stored hermes-agent session as the main alias", async () => {
