@@ -23,10 +23,12 @@ import { GatewayConnectScreen } from "@/features/agents/components/GatewayConnec
 import { useAgentStore, type AgentState } from "@/features/agents/state/store";
 import {
   buildAgentMainSessionKey,
-  type EventFrame,
   isSameSessionKey,
   parseAgentIdFromSessionKey,
+  type EventFrame,
+  type GatewayClient,
 } from "@/lib/gateway/GatewayClient";
+import { applySessionSettingMutation } from "@/features/agents/state/sessionSettingsMutations";
 import { useRuntimeConnection } from "@/lib/runtime/useRuntimeConnection";
 import {
   createStudioSettingsCoordinator,
@@ -2237,7 +2239,7 @@ export function OfficeScreen({
   const requestAgentHistoryRefresh = useCallback(
     async (params: {
       agentId: string;
-      reason: "chat-final-no-trace" | "run-start-no-chat";
+      reason: "chat-final-no-trace" | "run-start-no-chat" | "chat-open";
       sessionKey?: string;
     }) => {
       if (status !== "connected") return;
@@ -2840,6 +2842,29 @@ export function OfficeScreen({
       null)
     : null;
   const selectedLocalChatAgentId = focusedChatAgent?.agentId ?? null;
+  const focusedChatSessionKey = focusedChatAgent?.sessionKey;
+  const focusedChatSessionEpoch = focusedChatAgent?.sessionEpoch;
+  const focusedChatHistoryLoadedAt = focusedChatAgent?.historyLoadedAt;
+
+  useEffect(() => {
+    if (!chatOpen || status !== "connected" || !selectedLocalChatAgentId) return;
+    if (!focusedChatSessionKey || focusedChatHistoryLoadedAt !== null) return;
+    // Office does not mount AgentsPage's runtime sync controller. Opening a
+    // local chat must recover its canonical transcript before any new prompt.
+    void requestAgentHistoryRefresh({
+      agentId: selectedLocalChatAgentId,
+      reason: "chat-open",
+    });
+  }, [
+    chatOpen,
+    status,
+    selectedLocalChatAgentId,
+    focusedChatSessionKey,
+    focusedChatSessionEpoch,
+    focusedChatHistoryLoadedAt,
+    requestAgentHistoryRefresh,
+  ]);
+
   const agentEditorAgent = agentEditorAgentId
     ? (state.agents.find((agent) => agent.agentId === agentEditorAgentId) ?? null)
     : null;
@@ -5335,10 +5360,14 @@ export function OfficeScreen({
                     chatController.handleNewSession(focusedChatAgent.agentId)
                   }
                   onModelChange={(value) =>
-                    dispatch({
-                      type: "updateAgent",
+                    applySessionSettingMutation({
+                      agents: stateRef.current.agents,
+                      dispatch,
+                      client: client as unknown as GatewayClient,
                       agentId: focusedChatAgent.agentId,
-                      patch: { model: value ?? undefined },
+                      sessionKey: focusedChatAgent.sessionKey,
+                      field: "model",
+                      value,
                     })
                   }
                   onThinkingChange={(value) =>

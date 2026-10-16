@@ -23,6 +23,7 @@ type AgentsListResult = {
   agents: Array<{
     id: string;
     name?: string;
+    model?: string;
     role?: string;
     identity?: {
       name?: string;
@@ -233,10 +234,13 @@ export const deriveHydrateAgentFleetResult = (
     const modelProvider =
       typeof mainSession?.modelProvider === "string" ? mainSession.modelProvider.trim() : "";
     const modelId = typeof mainSession?.model === "string" ? mainSession.model.trim() : "";
+    const listedModel = typeof agent.model === "string" ? agent.model.trim() : "";
     const model =
       modelProvider && modelId
         ? `${modelProvider}/${modelId}`
-        : resolveDefaultModelForAgent(agent.id, input.configSnapshot);
+        : listedModel.includes("/")
+          ? listedModel
+          : resolveDefaultModelForAgent(agent.id, input.configSnapshot);
     const thinkingLevel =
       typeof mainSession?.thinkingLevel === "string" ? mainSession.thinkingLevel : null;
     const sessionExecHost = normalizeExecHost(mainSession?.execHost);

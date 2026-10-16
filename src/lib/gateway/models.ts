@@ -4,6 +4,7 @@ export type GatewayModelChoice = {
   provider: string;
   contextWindow?: number;
   reasoning?: boolean;
+  agentIds?: string[];
 };
 
 type GatewayModelAliasEntry = {

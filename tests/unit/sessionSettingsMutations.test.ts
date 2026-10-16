@@ -133,6 +133,15 @@ describe("session settings mutations helper", () => {
       agentId: "agent-1",
       line: "Model update failed: network timeout",
     });
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "updateAgent",
+      agentId: "agent-1",
+      patch: {
+        model: null,
+        sessionSettingsSynced: true,
+        sessionCreated: true,
+      },
+    });
   });
 
   it("restores sync state and appends capability notice when webchat patch is blocked", async () => {

@@ -1435,16 +1435,18 @@ export const AgentChatPanel = ({
 
   const modelOptions = useMemo(
     () =>
-      models.map((entry) => {
-        const key = `${entry.provider}/${entry.id}`;
-        const alias = typeof entry.name === "string" ? entry.name.trim() : "";
-        return {
-          value: key,
-          label: !alias || alias === key ? key : alias,
-          reasoning: entry.reasoning,
-        };
-      }),
-    [models]
+      models
+        .filter((entry) => !entry.agentIds || entry.agentIds.includes(agent.agentId))
+        .map((entry) => {
+          const key = `${entry.provider}/${entry.id}`;
+          const alias = typeof entry.name === "string" ? entry.name.trim() : "";
+          return {
+            value: key,
+            label: !alias || alias === key ? key : alias,
+            reasoning: entry.reasoning,
+          };
+        }),
+    [agent.agentId, models]
   );
   const modelValue = agent.model ?? "";
   const modelOptionsWithFallback =

@@ -124,6 +124,17 @@ export const applySessionSettingMutation = async ({
       return;
     }
     const msg = err instanceof Error ? err.message : buildFallbackError(field);
+    if (field === "model") {
+      dispatch({
+        type: "updateAgent",
+        agentId,
+        patch: {
+          model: previousModel,
+          sessionSettingsSynced: true,
+          sessionCreated: true,
+        },
+      });
+    }
     dispatch({
       type: "appendOutput",
       agentId,

@@ -27,6 +27,7 @@ type AgentsListResult = {
   agents: Array<{
     id: string;
     name?: string;
+    model?: string;
     identity?: {
       name?: string;
       theme?: string;

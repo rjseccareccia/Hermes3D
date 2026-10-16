@@ -127,7 +127,7 @@ describe("deriveHydrateAgentFleetResult", () => {
         defaultId: "agent-1",
         mainKey: "main",
         agents: [
-          { id: "agent-1", name: "One", identity: {} },
+          { id: "agent-1", name: "One", model: "ollama-cloud/deepseek-v4.1-flash", identity: {} },
           { id: "agent-2", name: "Two", identity: {} },
         ],
       },
@@ -161,6 +161,7 @@ describe("deriveHydrateAgentFleetResult", () => {
         ],
       },
     });
+    expect(result.seeds[0]?.model).toBe("ollama-cloud/deepseek-v4.1-flash");
 
     expect(result.summaryPatches.length).toBeGreaterThan(0);
     expect(result.suggestedSelectedAgentId).toBe("agent-2");
